@@ -6,15 +6,14 @@ What this script does:
 2. Navigates to Marketing Material Requests.
 3. Switches the grid to Processed.
 4. Applies the Username filter using a firm keyword.
-5. Reads approved rows from the Excel sheet.
-6. Scrapes approved rows from the website.
-7. Matches Excel rows to website rows by Employee + Processed Date + Approved status.
-8. Saves the phase-1 output to JSON so we can build phase 2 on top of it.
+5. Applies the Status filter so only Approved records remain.
+6. Scrapes the filtered approved rows directly from the website.
+7. Saves the phase-1 output to JSON so phase 2 can download from those rows.
 
-What this script does NOT do yet:
+What this script also does:
 - download attached documents
 - click Export to PDF
-- rename files
+- rename files and log recoverable issues
 """
 
 from __future__ import annotations
@@ -22,16 +21,15 @@ from __future__ import annotations
 import json
 import logging
 import os
+import math
 import re
 import shutil
 import time
 import traceback
 from dataclasses import dataclass, asdict
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 from pathlib import Path
 from typing import Iterable
-
-import openpyxl
 from selenium import webdriver
 from selenium.common.exceptions import (
     ElementClickInterceptedException,
@@ -88,8 +86,7 @@ EMAIL = os.getenv("EMAIL", "").strip()
 PASSWORD = os.getenv("PASSWORD", "").strip()
 
 FILTER_KEYWORD = os.getenv("FILTER_KEYWORD", "").strip()
-
-EXCEL_PATH = os.getenv("EXCEL_PATH", "").strip()
+FIRM_NAME = os.getenv("FIRM_NAME", "").strip()
 OUTPUT_FOLDER = os.getenv("OUTPUT_FOLDER", "").strip()
 
 
@@ -106,7 +103,10 @@ ARTIFACTS_DIRNAME = "_phase1_artifacts"
 JSON_OUTPUT_NAME = "phase1_matches.json"
 DOWNLOAD_SUMMARY_NAME = "phase2_download_summary.json"
 DOWNLOAD_ISSUES_NAME = "phase2_download_issues.txt"
+RUN_SUMMARY_NAME = "phase2_run_summary.json"
 DOWNLOAD_TIMEOUT = 45
+GRID_FETCH_BATCH_SIZE = 1000
+SCRIPT_TIMEOUT = 180
 
 
 # ============================================================================
@@ -127,15 +127,6 @@ log = logging.getLogger(__name__)
 # ============================================================================
 # DATA MODELS
 # ============================================================================
-
-@dataclass
-class ExcelRecord:
-    firm: str
-    employee: str
-    processed_date: date
-    title: str
-    status: str
-
 
 @dataclass
 class WebRecord:
@@ -187,37 +178,36 @@ class Phase2Issue:
     details: str
 
 
+@dataclass
+class RunSummary:
+    generated_at: str
+    keyword_filter: str
+    firm_name: str
+    record_count: int
+    successful_record_count: int
+    issue_count: int
+    total_downloaded_files: int
+    approval_pdf_count: int
+    attached_document_count: int
+    pdf_file_count: int
+    word_file_count: int
+    other_file_count: int
+    elapsed_seconds: float
+
+
+@dataclass
+class NamedFileEntry:
+    path: str
+    suffix_text: str
+    extension: str
+
+
 # ============================================================================
 # GENERIC HELPERS
 # ============================================================================
 
 def normalise_space(value: str) -> str:
     return re.sub(r"\s+", " ", value or "").strip()
-
-
-def canonical_person_name(value: str) -> str:
-    return normalise_space(value).casefold()
-
-
-def parse_date_value(raw) -> date | None:
-    if raw is None:
-        return None
-    if isinstance(raw, datetime):
-        return raw.date()
-    if isinstance(raw, date):
-        return raw
-
-    raw_text = normalise_space(str(raw))
-    if not raw_text:
-        return None
-
-    for fmt in ("%d-%m-%Y", "%d/%m/%Y", "%m/%d/%Y", "%m-%d-%Y", "%Y-%m-%d"):
-        try:
-            return datetime.strptime(raw_text, fmt).date()
-        except ValueError:
-            continue
-
-    return None
 
 
 def parse_date_from_web_text(raw_text: str) -> date | None:
@@ -316,6 +306,106 @@ def resolve_unique_target_path(
         counter += 1
 
 
+def build_download_target_path(
+    output_dir: Path,
+    firm: str,
+    date_str: str,
+    label: str,
+    extension: str,
+    serial: int | None = None,
+    suffix_text: str = "",
+) -> Path:
+    serial_text = f" - {serial}" if serial is not None else ""
+    return output_dir / f"{firm} - {date_str} - {label}{serial_text}{suffix_text}{extension}"
+
+
+def move_download_to_target(
+    source: Path,
+    requested_target: Path,
+    issue_log_path: Path,
+    issues: list[Phase2Issue],
+    match: MatchRecord,
+) -> Path:
+    if source.resolve() == requested_target.resolve():
+        return requested_target
+
+    target = resolve_unique_target_path(requested_target, issue_log_path, issues, match)
+    shutil.move(str(source), str(target))
+    return target
+
+
+def assign_named_download(
+    source_file: str,
+    output_dir: Path,
+    firm: str,
+    date_str: str,
+    label: str,
+    extension: str,
+    suffix_text: str,
+    naming_registry: dict[tuple[str, str, str], list[NamedFileEntry]],
+    issue_log_path: Path,
+    issues: list[Phase2Issue],
+    match: MatchRecord,
+) -> str:
+    registry_key = (firm, date_str, label)
+    existing_entries = naming_registry.setdefault(registry_key, [])
+    source_path = Path(source_file)
+
+    if not existing_entries:
+        target = build_download_target_path(
+            output_dir=output_dir,
+            firm=firm,
+            date_str=date_str,
+            label=label,
+            extension=extension,
+            suffix_text=suffix_text,
+        )
+        final_target = move_download_to_target(source_path, target, issue_log_path, issues, match)
+        existing_entries.append(
+            NamedFileEntry(
+                path=str(final_target),
+                suffix_text=suffix_text,
+                extension=extension,
+            )
+        )
+        return str(final_target)
+
+    if len(existing_entries) == 1:
+        first_entry = existing_entries[0]
+        first_source = Path(first_entry.path)
+        first_target = build_download_target_path(
+            output_dir=output_dir,
+            firm=firm,
+            date_str=date_str,
+            label=label,
+            extension=first_entry.extension,
+            serial=1,
+            suffix_text=first_entry.suffix_text,
+        )
+        first_final_target = move_download_to_target(first_source, first_target, issue_log_path, issues, match)
+        first_entry.path = str(first_final_target)
+
+    serial = len(existing_entries) + 1
+    target = build_download_target_path(
+        output_dir=output_dir,
+        firm=firm,
+        date_str=date_str,
+        label=label,
+        extension=extension,
+        serial=serial,
+        suffix_text=suffix_text,
+    )
+    final_target = move_download_to_target(source_path, target, issue_log_path, issues, match)
+    existing_entries.append(
+        NamedFileEntry(
+            path=str(final_target),
+            suffix_text=suffix_text,
+            extension=extension,
+        )
+    )
+    return str(final_target)
+
+
 def wait_for(
     driver: webdriver.Chrome,
     condition,
@@ -408,62 +498,6 @@ def first_visible(driver: webdriver.Chrome, selectors: Iterable[tuple[By, str]],
 
 
 # ============================================================================
-# EXCEL
-# ============================================================================
-
-def read_excel_manifest(excel_path: str) -> list[ExcelRecord]:
-    log.info("Reading Excel manifest: %s", excel_path)
-
-    workbook = openpyxl.load_workbook(excel_path, read_only=True, data_only=True)
-    worksheet = workbook.active
-    rows = list(worksheet.iter_rows(values_only=True))
-
-    if not rows:
-        raise ValueError("Excel file is empty.")
-
-    headers = [normalise_space(str(cell or "")).casefold() for cell in rows[0]]
-
-    def find_column(name: str) -> int:
-        key = name.casefold()
-        for index, header in enumerate(headers):
-            if key in header:
-                return index
-        raise KeyError(f"Column containing '{name}' was not found in Excel headers: {headers}")
-
-    idx_firm = find_column("firm")
-    idx_employee = find_column("employee")
-    idx_processed_date = find_column("processed date")
-    idx_title = find_column("title of piece")
-    idx_status = find_column("status")
-
-    records: list[ExcelRecord] = []
-
-    for row in rows[1:]:
-        status = normalise_space(str(row[idx_status] or ""))
-        if status.casefold() != "approved":
-            continue
-
-        employee = normalise_space(str(row[idx_employee] or ""))
-        processed_date = parse_date_value(row[idx_processed_date])
-        if not employee or processed_date is None:
-            continue
-
-        records.append(
-            ExcelRecord(
-                firm=normalise_space(str(row[idx_firm] or "")),
-                employee=employee,
-                processed_date=processed_date,
-                title=normalise_space(str(row[idx_title] or "")),
-                status=status,
-            )
-        )
-
-    workbook.close()
-    log.info("Found %d approved records in Excel.", len(records))
-    return records
-
-
-# ============================================================================
 # DRIVER
 # ============================================================================
 
@@ -490,6 +524,7 @@ def create_driver(download_dir: str) -> webdriver.Chrome:
     service = Service(ChromeDriverManager().install())
     driver = webdriver.Chrome(service=service, options=options)
     driver.implicitly_wait(1)
+    driver.set_script_timeout(SCRIPT_TIMEOUT)
     return driver
 
 
@@ -637,25 +672,6 @@ def switch_to_processed(driver: webdriver.Chrome, artifacts_dir: Path) -> None:
         raise
 
 
-def build_processed_date_filter_groups(excel_records: list[ExcelRecord]) -> list[dict]:
-    unique_dates = sorted({record.processed_date for record in excel_records})
-    groups: list[dict] = []
-
-    for processed_day in unique_dates:
-        next_day = processed_day + timedelta(days=1)
-        groups.append(
-            {
-                "logic": "and",
-                "filters": [
-                    {"field": "ApprovedDate", "operator": "gte", "value": processed_day.isoformat()},
-                    {"field": "ApprovedDate", "operator": "lt", "value": next_day.isoformat()},
-                ],
-            }
-        )
-
-    return groups
-
-
 def apply_initial_keyword_filter(
     driver: webdriver.Chrome,
     keyword: str,
@@ -720,40 +736,15 @@ def apply_initial_keyword_filter(
 
 
 # ============================================================================
-# GRID MATCHING
+# GRID RECORD COLLECTION
 # ============================================================================
 
-def group_excel_records(records: list[ExcelRecord]) -> list[ExcelRecord]:
-    grouped: dict[tuple[str, date, str], ExcelRecord] = {}
-    for record in records:
-        key = (
-            canonical_person_name(record.employee),
-            record.processed_date,
-            normalise_space(record.firm).casefold(),
-        )
-        grouped.setdefault(key, record)
-    return list(grouped.values())
-
-
-def fetch_web_records_for_excel_record(
-    driver: webdriver.Chrome,
-    excel_record: ExcelRecord,
-    keyword: str,
-) -> list[WebRecord]:
-    next_day = excel_record.processed_date + timedelta(days=1)
-    log.info(
-        "Matching web rows for employee='%s' processed_date=%s",
-        excel_record.employee,
-        excel_record.processed_date.isoformat(),
-    )
-
+def fetch_filtered_grid_page(driver: webdriver.Chrome, page_number: int, page_size: int) -> dict:
     page_items = driver.execute_async_script(
         """
         const done = arguments[arguments.length - 1];
-        const keyword = arguments[0];
-        const employee = arguments[1];
-        const startDate = arguments[2];
-        const endDate = arguments[3];
+        const pageNumber = arguments[0];
+        const requestedPageSize = arguments[1];
 
         const gridElement = document.getElementById('mm-processed');
         if (!gridElement || !window.jQuery) {
@@ -766,17 +757,6 @@ def fetch_web_records_for_excel_record(
             done({ ok: false, reason: 'kendo_grid_missing' });
             return;
         }
-
-        const finalFilter = {
-            logic: 'and',
-            filters: [
-                { field: 'UserName', operator: 'contains', value: keyword },
-                { field: 'StatusName', operator: 'eq', value: 'Approved' },
-                { field: 'EmployeeName', operator: 'eq', value: employee },
-                { field: 'ApprovedDate', operator: 'gte', value: new Date(startDate) },
-                { field: 'ApprovedDate', operator: 'lt', value: new Date(endDate) }
-            ]
-        };
 
         function serializeRows() {
             const view = grid.dataSource.view();
@@ -796,42 +776,89 @@ def fetch_web_records_for_excel_record(
             return rows;
         }
 
-        grid.one('dataBound', function () {
+        function complete() {
+            const activePageSize = grid.dataSource.pageSize() || requestedPageSize || 0;
             done({
                 ok: true,
                 total: grid.dataSource.total(),
+                page: grid.dataSource.page() || pageNumber,
+                pageSize: activePageSize,
                 rows: serializeRows()
             });
-        });
+        }
 
-        grid.dataSource.page(1);
-        grid.dataSource.filter(finalFilter);
+        const currentPage = grid.dataSource.page() || 1;
+        const currentPageSize = grid.dataSource.pageSize() || 0;
+        if (currentPage === pageNumber && currentPageSize === requestedPageSize) {
+            window.setTimeout(complete, 0);
+            return;
+        }
+
+        grid.one('dataBound', complete);
+
+        grid.dataSource.query({
+            page: pageNumber,
+            pageSize: requestedPageSize,
+            filter: grid.dataSource.filter(),
+            sort: grid.dataSource.sort(),
+            group: grid.dataSource.group()
+        });
         """,
-        keyword,
-        excel_record.employee,
-        excel_record.processed_date.isoformat(),
-        next_day.isoformat(),
+        page_number,
+        page_size,
     )
 
     if not page_items or not page_items.get("ok"):
-        raise RuntimeError(
-            f"Could not fetch web rows for {excel_record.employee} | {excel_record.processed_date}: {page_items}"
-        )
+        raise RuntimeError(f"Could not fetch grid page {page_number} with page_size {page_size}: {page_items}")
 
-    rows = page_items.get("rows", [])
-    total = int(page_items.get("total") or 0)
-    if total > len(rows):
-        log.warning(
-            "Grid returned total=%d but only %d rows on first page for %s | %s. "
-            "Keeping first-page rows only.",
-            total,
-            len(rows),
-            excel_record.employee,
-            excel_record.processed_date,
+    return page_items
+
+
+def fetch_all_filtered_web_records(driver: webdriver.Chrome, keyword: str) -> list[WebRecord]:
+    log.info("Collecting filtered approved records directly from the processed grid.")
+
+    first_page = fetch_filtered_grid_page(driver, 1, 100)
+    total = int(first_page.get("total") or 0)
+    initial_page_size = int(first_page.get("pageSize") or 0)
+    batch_page_size = min(max(initial_page_size, GRID_FETCH_BATCH_SIZE), total) if total else initial_page_size
+
+    if total > 0 and batch_page_size and batch_page_size != initial_page_size:
+        log.info(
+            "Expanding grid fetch batch size from %d to %d to reduce pre-download paging.",
+            initial_page_size,
+            batch_page_size,
         )
+        first_page = fetch_filtered_grid_page(driver, 1, batch_page_size)
+
+    page_size = int(first_page.get("pageSize") or 0)
+    if batch_page_size and page_size and page_size < batch_page_size:
+        log.warning(
+            "Grid kept page size at %d even after requesting %d. Collection will continue in %d page(s).",
+            page_size,
+            batch_page_size,
+            max(1, math.ceil(total / page_size)),
+        )
+    total_pages = max(1, math.ceil(total / page_size)) if page_size else 1
+
+    all_rows = []
+    for row in first_page.get("rows", []):
+        row["row_page"] = int(first_page.get("page") or 1)
+        all_rows.append(row)
+    log.info(
+        "Filtered grid has total=%d row(s), page_size=%d, total_pages=%d",
+        total,
+        page_size,
+        total_pages,
+    )
+
+    for page_number in range(2, total_pages + 1):
+        page_items = fetch_filtered_grid_page(driver, page_number, page_size)
+        for row in page_items.get("rows", []):
+            row["row_page"] = int(page_items.get("page") or page_number)
+            all_rows.append(row)
 
     page_records: list[WebRecord] = []
-    for item in rows:
+    for item in all_rows:
         employee = normalise_space(item.get("employee", ""))
         processed_date_text = normalise_space(item.get("processed_date_text", ""))
         processed_date = parse_date_from_web_text(processed_date_text)
@@ -854,7 +881,7 @@ def fetch_web_records_for_excel_record(
                 processed_date_text=processed_date_text,
                 status=normalise_space(item.get("status", "")),
                 title=normalise_space(item.get("title", "")),
-                row_page=1,
+                row_page=int(item.get("row_page", 1) or 1),
                 row_index=int(item.get("row_index", 0) or 0),
                 view_href=view_href,
                 indirect_request_id=indirect_request_id,
@@ -862,48 +889,38 @@ def fetch_web_records_for_excel_record(
         )
 
     log.info(
-        "Fetched %d candidate web row(s) for %s | %s",
+        "Collected %d approved web record(s) for keyword '%s'.",
         len(page_records),
-        excel_record.employee,
-        excel_record.processed_date.isoformat(),
+        keyword,
     )
     return page_records
 
 
-# ============================================================================
-# MATCHING
-# ============================================================================
+def build_matches_from_web_records(web_records: list[WebRecord], firm_label: str) -> list[MatchRecord]:
+    matches: list[MatchRecord] = []
 
-def match_records(excel_records: list[ExcelRecord], web_records: list[WebRecord]) -> list[MatchRecord]:
-    matched: list[MatchRecord] = []
+    for web_record in web_records:
+        if web_record.status.casefold() != "approved":
+            continue
 
-    approved_web_records = [record for record in web_records if record.status.casefold() == "approved"]
-
-    for excel_record in excel_records:
-        for web_record in approved_web_records:
-            if canonical_person_name(excel_record.employee) != canonical_person_name(web_record.employee):
-                continue
-            if excel_record.processed_date != web_record.processed_date:
-                continue
-
-            matched.append(
-                MatchRecord(
-                    firm=excel_record.firm,
-                    employee=excel_record.employee,
-                    processed_date_excel=excel_record.processed_date.isoformat(),
-                    processed_date_web=web_record.processed_date_text,
-                    username=web_record.username,
-                    title=web_record.title,
-                    status=web_record.status,
-                    row_page=web_record.row_page,
-                    row_index=web_record.row_index,
-                    view_href=web_record.view_href,
-                    indirect_request_id=web_record.indirect_request_id,
-                )
+        matches.append(
+            MatchRecord(
+                firm=firm_label,
+                employee=web_record.employee,
+                processed_date_excel=web_record.processed_date.isoformat(),
+                processed_date_web=web_record.processed_date_text,
+                username=web_record.username,
+                title=web_record.title,
+                status=web_record.status,
+                row_page=web_record.row_page,
+                row_index=web_record.row_index,
+                view_href=web_record.view_href,
+                indirect_request_id=web_record.indirect_request_id,
             )
+        )
 
-    log.info("Matched %d records.", len(matched))
-    return matched
+    log.info("Prepared %d phase-2 record(s) directly from web results.", len(matches))
+    return matches
 
 
 def unique_match_records(matches: list[MatchRecord]) -> list[MatchRecord]:
@@ -1039,36 +1056,49 @@ def rename_downloaded_files(
     doc_files: list[str],
     approval_file: str | None,
     output_dir: Path,
-    approval_counters: dict[tuple[str, str], int],
-    doc_counters: dict[tuple[str, str], int],
+    naming_registry: dict[tuple[str, str, str], list[NamedFileEntry]],
     issue_log_path: Path,
     issues: list[Phase2Issue],
 ) -> DownloadOutcome:
     firm = normalise_space(match.firm).lower()
     processed_date = datetime.fromisoformat(match.processed_date_excel).date()
     date_str = processed_date.strftime("%m.%d.%Y")
-    key = (firm, date_str)
 
     final_doc_files: list[str] = []
     for doc_file in doc_files:
         source = Path(doc_file)
         ext = source.suffix or ".docx"
-        doc_counters[key] = doc_counters.get(key, 0) + 1
-        serial = doc_counters[key]
-        target = output_dir / f"{firm} - {date_str} - Doc - {serial}{ext}"
-        target = resolve_unique_target_path(target, issue_log_path, issues, match)
-        shutil.move(str(source), str(target))
-        final_doc_files.append(str(target))
+        final_target = assign_named_download(
+            source_file=str(source),
+            output_dir=output_dir,
+            firm=firm,
+            date_str=date_str,
+            label="Doc",
+            extension=ext,
+            suffix_text="",
+            naming_registry=naming_registry,
+            issue_log_path=issue_log_path,
+            issues=issues,
+            match=match,
+        )
+        final_doc_files.append(final_target)
 
     final_approval_file: str | None = None
     if approval_file:
-        approval_counters[key] = approval_counters.get(key, 0) + 1
-        serial = approval_counters[key]
         suffix = " ( No Doc )" if not final_doc_files else ""
-        target = output_dir / f"{firm} - {date_str} - Approval - {serial}{suffix}.pdf"
-        target = resolve_unique_target_path(target, issue_log_path, issues, match)
-        shutil.move(str(approval_file), str(target))
-        final_approval_file = str(target)
+        final_approval_file = assign_named_download(
+            source_file=str(approval_file),
+            output_dir=output_dir,
+            firm=firm,
+            date_str=date_str,
+            label="Approval",
+            extension=".pdf",
+            suffix_text=suffix,
+            naming_registry=naming_registry,
+            issue_log_path=issue_log_path,
+            issues=issues,
+            match=match,
+        )
 
     return DownloadOutcome(
         firm=firm,
@@ -1090,8 +1120,7 @@ def process_phase_2_downloads(
     unique_matches = unique_match_records(matches)
     log.info("Phase 2 will process %d unique matched record(s).", len(unique_matches))
 
-    approval_counters: dict[tuple[str, str], int] = {}
-    doc_counters: dict[tuple[str, str], int] = {}
+    naming_registry: dict[tuple[str, str, str], list[NamedFileEntry]] = {}
     outcomes: list[DownloadOutcome] = []
     issues: list[Phase2Issue] = []
     issue_log_path = output_dir / DOWNLOAD_ISSUES_NAME
@@ -1123,8 +1152,7 @@ def process_phase_2_downloads(
                 doc_files=doc_files,
                 approval_file=approval_file,
                 output_dir=output_dir,
-                approval_counters=approval_counters,
-                doc_counters=doc_counters,
+                naming_registry=naming_registry,
                 issue_log_path=issue_log_path,
                 issues=issues,
             )
@@ -1151,6 +1179,63 @@ def save_phase2_summary(output_dir: Path, outcomes: list[DownloadOutcome]) -> Pa
         "records": [asdict(outcome) for outcome in outcomes],
     }
     output_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return output_path
+
+
+def build_run_summary(
+    keyword_filter: str,
+    firm_name: str,
+    record_count: int,
+    outcomes: list[DownloadOutcome],
+    issues: list[Phase2Issue],
+    elapsed_seconds: float,
+) -> RunSummary:
+    total_downloaded_files = 0
+    approval_pdf_count = 0
+    attached_document_count = 0
+    pdf_file_count = 0
+    word_file_count = 0
+    other_file_count = 0
+    word_extensions = {".doc", ".docx"}
+
+    for outcome in outcomes:
+        if outcome.approval_file:
+            approval_pdf_count += 1
+            total_downloaded_files += 1
+            pdf_file_count += 1
+
+        attached_document_count += len(outcome.doc_files)
+        total_downloaded_files += len(outcome.doc_files)
+
+        for file_path in outcome.doc_files:
+            suffix = Path(file_path).suffix.casefold()
+            if suffix == ".pdf":
+                pdf_file_count += 1
+            elif suffix in word_extensions:
+                word_file_count += 1
+            else:
+                other_file_count += 1
+
+    return RunSummary(
+        generated_at=datetime.now().isoformat(),
+        keyword_filter=keyword_filter,
+        firm_name=firm_name,
+        record_count=record_count,
+        successful_record_count=len(outcomes),
+        issue_count=len(issues),
+        total_downloaded_files=total_downloaded_files,
+        approval_pdf_count=approval_pdf_count,
+        attached_document_count=attached_document_count,
+        pdf_file_count=pdf_file_count,
+        word_file_count=word_file_count,
+        other_file_count=other_file_count,
+        elapsed_seconds=round(elapsed_seconds, 2),
+    )
+
+
+def save_run_summary(output_dir: Path, summary: RunSummary) -> Path:
+    output_path = output_dir / RUN_SUMMARY_NAME
+    output_path.write_text(json.dumps(asdict(summary), indent=2), encoding="utf-8")
     return output_path
 
 
@@ -1184,8 +1269,8 @@ def main() -> None:
         missing_config.append("PASSWORD")
     if not FILTER_KEYWORD:
         missing_config.append("FILTER_KEYWORD")
-    if not EXCEL_PATH:
-        missing_config.append("EXCEL_PATH")
+    if not FIRM_NAME:
+        missing_config.append("FIRM_NAME")
     if not OUTPUT_FOLDER:
         missing_config.append("OUTPUT_FOLDER")
 
@@ -1200,15 +1285,11 @@ def main() -> None:
     output_dir = ensure_dir(OUTPUT_FOLDER)
     artifacts_dir = ensure_dir(output_dir / ARTIFACTS_DIRNAME)
     temp_download_dir = ensure_dir(output_dir / "_temp_downloads_phase1")
+    run_started_at = time.time()
 
     driver: webdriver.Chrome | None = None
 
     try:
-        excel_records = read_excel_manifest(EXCEL_PATH)
-        if not excel_records:
-            log.error("No approved rows were found in the Excel file.")
-            return
-
         driver = create_driver(str(temp_download_dir))
 
         login(driver, artifacts_dir)
@@ -1216,23 +1297,37 @@ def main() -> None:
         switch_to_processed(driver, artifacts_dir)
         apply_initial_keyword_filter(driver, FILTER_KEYWORD, artifacts_dir)
 
-        web_records: list[WebRecord] = []
-        grouped_excel_records = group_excel_records(excel_records)
-        log.info("Matching against %d unique approved Excel employee/date combination(s).", len(grouped_excel_records))
-        for excel_record in grouped_excel_records:
-            web_records.extend(fetch_web_records_for_excel_record(driver, excel_record, FILTER_KEYWORD))
+        web_records = fetch_all_filtered_web_records(driver, FILTER_KEYWORD)
 
         if not web_records:
             save_debug_artifacts(driver, artifacts_dir, "no_web_rows")
+            run_summary = build_run_summary(
+                keyword_filter=FILTER_KEYWORD,
+                firm_name=FIRM_NAME,
+                record_count=0,
+                outcomes=[],
+                issues=[],
+                elapsed_seconds=time.time() - run_started_at,
+            )
+            save_run_summary(output_dir, run_summary)
             log.error("No rows were scraped from the website after filtering.")
             return
 
-        matches = match_records(excel_records, web_records)
+        matches = build_matches_from_web_records(web_records, FIRM_NAME)
         output_path = save_phase1_output(output_dir, matches, web_records)
 
         if not matches:
             save_debug_artifacts(driver, artifacts_dir, "no_matches")
-            log.warning("Phase 1 ran successfully, but no Excel rows matched the website rows.")
+            run_summary = build_run_summary(
+                keyword_filter=FILTER_KEYWORD,
+                firm_name=FIRM_NAME,
+                record_count=0,
+                outcomes=[],
+                issues=[],
+                elapsed_seconds=time.time() - run_started_at,
+            )
+            save_run_summary(output_dir, run_summary)
+            log.warning("Phase 1 ran successfully, but no approved website rows were prepared for download.")
         else:
             log.info("Phase 1 completed successfully.")
 
@@ -1248,6 +1343,16 @@ def main() -> None:
             )
             phase2_summary = save_phase2_summary(output_dir, phase2_outcomes)
             log.info("Phase 2 completed successfully. Download summary: %s", phase2_summary)
+            run_summary = build_run_summary(
+                keyword_filter=FILTER_KEYWORD,
+                firm_name=FIRM_NAME,
+                record_count=len(matches),
+                outcomes=phase2_outcomes,
+                issues=phase2_issues,
+                elapsed_seconds=time.time() - run_started_at,
+            )
+            run_summary_path = save_run_summary(output_dir, run_summary)
+            log.info("Run summary saved: %s", run_summary_path)
             if phase2_issues:
                 log.warning(
                     "Phase 2 completed with %d logged issue(s). Review: %s",
