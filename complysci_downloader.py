@@ -88,6 +88,7 @@ PASSWORD = os.getenv("PASSWORD", "").strip()
 FILTER_KEYWORD = os.getenv("FILTER_KEYWORD", "").strip()
 FIRM_NAME = os.getenv("FIRM_NAME", "").strip()
 OUTPUT_FOLDER = os.getenv("OUTPUT_FOLDER", "").strip()
+RESUME_FROM_PROCESSED_DATE = os.getenv("RESUME_FROM_PROCESSED_DATE", "").strip()
 
 
 # ============================================================================
@@ -215,6 +216,21 @@ def parse_date_from_web_text(raw_text: str) -> date | None:
     if not match:
         return None
     return datetime.strptime(match.group(1), "%m/%d/%Y").date()
+
+
+def parse_resume_date_config(raw_text: str) -> date:
+    value = normalise_space(raw_text)
+    formats = ("%Y-%m-%d", "%m.%d.%Y", "%m/%d/%Y")
+
+    for date_format in formats:
+        try:
+            return datetime.strptime(value, date_format).date()
+        except ValueError:
+            continue
+
+    raise ValueError(
+        "RESUME_FROM_PROCESSED_DATE must use YYYY-MM-DD, MM.DD.YYYY, or MM/DD/YYYY format."
+    )
 
 
 def format_web_datetime(raw) -> str:
@@ -937,6 +953,60 @@ def unique_match_records(matches: list[MatchRecord]) -> list[MatchRecord]:
     return unique
 
 
+def load_completed_request_ids(output_dir: Path) -> set[str]:
+    summary_path = output_dir / DOWNLOAD_SUMMARY_NAME
+    if not summary_path.exists():
+        log.info("No previous phase-2 summary found at %s; resume will not skip completed request IDs.", summary_path)
+        return set()
+
+    try:
+        payload = json.loads(summary_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        log.warning("Could not read previous phase-2 summary at %s: %s", summary_path, exc)
+        return set()
+
+    completed_ids: set[str] = set()
+    for record in payload.get("records", []):
+        request_id = normalise_space(record.get("indirect_request_id", ""))
+        if request_id:
+            completed_ids.add(request_id)
+
+    log.info("Loaded %d completed request ID(s) from previous phase-2 summary.", len(completed_ids))
+    return completed_ids
+
+
+def filter_matches_for_resume(matches: list[MatchRecord], output_dir: Path) -> list[MatchRecord]:
+    if not RESUME_FROM_PROCESSED_DATE:
+        return matches
+
+    resume_date = parse_resume_date_config(RESUME_FROM_PROCESSED_DATE)
+    completed_ids = load_completed_request_ids(output_dir)
+    filtered_matches: list[MatchRecord] = []
+    skipped_newer = 0
+    skipped_completed = 0
+
+    for match in matches:
+        processed_date = datetime.fromisoformat(match.processed_date_excel).date()
+        if processed_date > resume_date:
+            skipped_newer += 1
+            continue
+
+        if match.indirect_request_id and match.indirect_request_id in completed_ids:
+            skipped_completed += 1
+            continue
+
+        filtered_matches.append(match)
+
+    log.info(
+        "Resume from processed date %s: kept %d record(s), skipped %d newer record(s), skipped %d already completed record(s).",
+        resume_date.isoformat(),
+        len(filtered_matches),
+        skipped_newer,
+        skipped_completed,
+    )
+    return filtered_matches
+
+
 # ============================================================================
 # PHASE 2 DOWNLOADS
 # ============================================================================
@@ -1333,10 +1403,12 @@ def main() -> None:
 
         log.info("Phase 1 JSON output: %s", output_path)
 
-        if matches:
+        phase2_matches = filter_matches_for_resume(matches, output_dir)
+
+        if phase2_matches:
             phase2_outcomes, phase2_issues, phase2_issue_log = process_phase_2_downloads(
                 driver=driver,
-                matches=matches,
+                matches=phase2_matches,
                 output_dir=output_dir,
                 artifacts_dir=artifacts_dir,
                 download_dir=temp_download_dir,
@@ -1346,7 +1418,7 @@ def main() -> None:
             run_summary = build_run_summary(
                 keyword_filter=FILTER_KEYWORD,
                 firm_name=FIRM_NAME,
-                record_count=len(matches),
+                record_count=len(phase2_matches),
                 outcomes=phase2_outcomes,
                 issues=phase2_issues,
                 elapsed_seconds=time.time() - run_started_at,
@@ -1361,6 +1433,17 @@ def main() -> None:
                 )
             else:
                 log.info("Phase 2 completed with no logged download/naming issues.")
+        elif matches:
+            log.info("No phase-2 records left after applying resume filters.")
+            run_summary = build_run_summary(
+                keyword_filter=FILTER_KEYWORD,
+                firm_name=FIRM_NAME,
+                record_count=0,
+                outcomes=[],
+                issues=[],
+                elapsed_seconds=time.time() - run_started_at,
+            )
+            save_run_summary(output_dir, run_summary)
 
     except Exception as exc:
         log.critical("Fatal error: %s", exc)
