@@ -4,7 +4,7 @@ from collections import defaultdict
 from datetime import datetime
 
 # 🔹 Update this path
-FOLDER_PATH = r"C:\Users\varun\Downloads\downloaded files from comply\Sykon"
+FOLDER_PATH = r"C:\Users\varun\Downloads\downloaded files from comply\YellowWood"
 
 # =========================
 # 🔧 REGEX FOR DATE
